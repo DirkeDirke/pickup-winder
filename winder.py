@@ -1,8 +1,29 @@
 """Hardware-independent winding and traverse calculations."""
 
+import math
+
 
 def _clamp(value, minimum, maximum):
     return min(maximum, max(minimum, value))
+
+
+def coalesce_counter_edges(edge_count):
+    """Collapse one noisy hardware-counter batch into at most one candidate pulse."""
+    edge_count = int(edge_count)
+    if edge_count < 0:
+        raise ValueError("edge_count must not be negative")
+    return 1 if edge_count else 0
+
+
+def servo_sweep_degrees(travel_mm, arm_length_mm):
+    """Return symmetric arm angle needed to span a straight-line chord."""
+    travel_mm = float(travel_mm)
+    arm_length_mm = float(arm_length_mm)
+    if travel_mm <= 0 or arm_length_mm <= 0:
+        raise ValueError("servo geometry must be positive")
+    if travel_mm > 2 * arm_length_mm:
+        raise ValueError("travel cannot exceed the servo arm diameter")
+    return math.degrees(2 * math.asin(travel_mm / (2 * arm_length_mm)))
 
 
 class SpeedController:
@@ -29,6 +50,10 @@ class SpeedController:
         open_loop=False,
         fixed_duty=0,
         debug_overspeed_rpm=300,
+        startup_kick_duty=0,
+        startup_kick_seconds=0,
+        overspeed_confirmations=1,
+        ramp_down_per_second=None,
     ):
         if target_rpm <= 0:
             raise ValueError("target_rpm must be positive")
@@ -36,6 +61,8 @@ class SpeedController:
             raise ValueError("motor duty limits are invalid")
         if ramp_per_second <= 0 or kp < 0 or ki < 0:
             raise ValueError("controller tuning values are invalid")
+        if ramp_down_per_second is not None and ramp_down_per_second <= 0:
+            raise ValueError("ramp_down_per_second must be positive")
         if not 0 < filter_alpha <= 1:
             raise ValueError("filter_alpha must be in (0, 1]")
         if int(pulses_per_revolution) != pulses_per_revolution or pulses_per_revolution <= 0:
@@ -44,11 +71,20 @@ class SpeedController:
             raise ValueError("fixed_duty must be within the motor duty limit")
         if debug_overspeed_rpm <= 0:
             raise ValueError("debug_overspeed_rpm must be positive")
+        if not 0 <= startup_kick_duty <= maximum_duty:
+            raise ValueError("startup_kick_duty must be within the motor duty limit")
+        if startup_kick_seconds < 0:
+            raise ValueError("startup_kick_seconds must not be negative")
+        if int(overspeed_confirmations) != overspeed_confirmations or overspeed_confirmations <= 0:
+            raise ValueError("overspeed_confirmations must be a positive integer")
         self.target_rpm = float(target_rpm)
         self.startup_duty = float(startup_duty)
         self.minimum_duty = float(minimum_duty)
         self.maximum_duty = float(maximum_duty)
         self.ramp_per_second = float(ramp_per_second)
+        if ramp_down_per_second is None:
+            ramp_down_per_second = ramp_per_second
+        self.ramp_down_per_second = float(ramp_down_per_second)
         self.kp = float(kp)
         self.ki = float(ki)
         self.filter_alpha = float(filter_alpha)
@@ -63,6 +99,9 @@ class SpeedController:
         self.open_loop = bool(open_loop)
         self.fixed_duty = float(fixed_duty)
         self.debug_overspeed_rpm = float(debug_overspeed_rpm)
+        self.startup_kick_duty = float(startup_kick_duty)
+        self.startup_kick_seconds = float(startup_kick_seconds)
+        self.overspeed_confirmations = int(overspeed_confirmations)
         self.running = False
         self.fault = None
         self.duty = 0.0
@@ -71,6 +110,11 @@ class SpeedController:
         self._started_at = None
         self._last_update = None
         self._last_pulse = None
+        self._rpm_window_started = None
+        self._rpm_window_pulses = 0
+        self._rpm_measurement_number = 0
+        self._checked_measurement_number = 0
+        self.overspeed_count = 0
 
     @property
     def stall_timeout(self):
@@ -110,6 +154,11 @@ class SpeedController:
         self._started_at = float(now)
         self._last_update = float(now)
         self._last_pulse = None
+        self._rpm_window_started = None
+        self._rpm_window_pulses = 0
+        self._rpm_measurement_number = 0
+        self._checked_measurement_number = 0
+        self.overspeed_count = 0
 
     def stop(self, reason=None):
         """Stop motor output, optionally latching a safety fault reason."""
@@ -118,19 +167,31 @@ class SpeedController:
         self.duty = 0.0
 
     def observe_pulse(self, now):
-        """Record a pulse and update period-based RPM; return whether accepted."""
+        """Record a pulse and update full-revolution RPM; return whether accepted."""
         now = float(now)
         if self._last_pulse is not None:
             period = now - self._last_pulse
             if period < self.minimum_pulse_interval:
                 return False
-            instantaneous = 60.0 / (period * self.pulses_per_revolution)
+        self._last_pulse = now
+
+        if self._rpm_window_started is None:
+            self._rpm_window_started = now
+            self._rpm_window_pulses = 0
+            return True
+
+        self._rpm_window_pulses += 1
+        if self._rpm_window_pulses >= self.pulses_per_revolution:
+            revolution_period = now - self._rpm_window_started
+            instantaneous = 60.0 / revolution_period
             if self.measured_rpm is None:
                 self.measured_rpm = instantaneous
             else:
                 alpha = self.filter_alpha
                 self.measured_rpm += alpha * (instantaneous - self.measured_rpm)
-        self._last_pulse = now
+            self._rpm_window_started = now
+            self._rpm_window_pulses = 0
+            self._rpm_measurement_number += 1
         return True
 
     def update(self, now):
@@ -151,7 +212,9 @@ class SpeedController:
             self.stop("stall")
             return 0.0
 
-        if self.measured_rpm is not None:
+        new_measurement = self._rpm_measurement_number != self._checked_measurement_number
+        if self.measured_rpm is not None and new_measurement:
+            self._checked_measurement_number = self._rpm_measurement_number
             if self.open_loop:
                 overspeed_limit = self.debug_overspeed_rpm
             else:
@@ -160,11 +223,19 @@ class SpeedController:
                     self.target_rpm + self.overspeed_margin_rpm,
                 )
             if self.measured_rpm > overspeed_limit:
-                self.stop("overspeed")
-                return 0.0
+                self.overspeed_count += 1
+                if self.overspeed_count >= self.overspeed_confirmations:
+                    self.stop("overspeed")
+                    return 0.0
+            else:
+                self.overspeed_count = 0
 
         if self.open_loop:
             self.duty = self.fixed_duty
+            return self.duty
+
+        if now - self._started_at < self.startup_kick_seconds:
+            self.duty = self.startup_kick_duty
             return self.duty
 
         if self.measured_rpm is not None:
@@ -178,8 +249,12 @@ class SpeedController:
             requested_duty = self.startup_duty
 
         requested_duty = _clamp(requested_duty, self.minimum_duty, self.maximum_duty)
-        maximum_change = self.ramp_per_second * elapsed
-        self.duty += _clamp(requested_duty - self.duty, -maximum_change, maximum_change)
+        requested_change = requested_duty - self.duty
+        if requested_change < 0:
+            maximum_change = self.ramp_down_per_second * elapsed
+        else:
+            maximum_change = self.ramp_per_second * elapsed
+        self.duty += _clamp(requested_change, -maximum_change, maximum_change)
         return self.duty
 
 

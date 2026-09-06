@@ -10,10 +10,16 @@ import supervisor
 from adafruit_motorkit import MotorKit
 
 import config
-from winder import SpeedController, WinderState, motor_throttle, servo_duty_cycle
+from winder import (
+    SpeedController,
+    WinderState,
+    coalesce_counter_edges,
+    motor_throttle,
+    servo_duty_cycle,
+)
 
 
-SENSOR_PIN = board.D7      # RX silk label, PWM slice 2B (required by countio)
+SENSOR_PIN = board.D7      # RX silk label; externally debounced active-low switch
 SERVO_PWM_PIN = board.D3   # A3 silk label, PWM slice 5A
 
 
@@ -23,7 +29,7 @@ state = WinderState(
     config.WIRE_DIAMETER_MM,
     config.PULSES_PER_REVOLUTION,
 )
-sensor = countio.Counter(SENSOR_PIN, edge=countio.Edge.RISE, pull=None)
+sensor = countio.Counter(SENSOR_PIN, edge=countio.Edge.FALL, pull=None)
 i2c = board.I2C()  # QT Py SDA/D4 and SCL/D5 pins
 motor_hat = MotorKit(
     i2c=i2c,
@@ -39,7 +45,8 @@ speed = SpeedController(
     startup_duty=config.START_MOTOR_DUTY_PERCENT,
     minimum_duty=config.MIN_MOTOR_DUTY_PERCENT,
     maximum_duty=config.MAX_MOTOR_DUTY_PERCENT,
-    ramp_per_second=config.MOTOR_RAMP_PERCENT_PER_SECOND,
+    ramp_per_second=config.MOTOR_RAMP_UP_PERCENT_PER_SECOND,
+    ramp_down_per_second=config.MOTOR_RAMP_DOWN_PERCENT_PER_SECOND,
     kp=config.SPEED_KP,
     ki=config.SPEED_KI,
     filter_alpha=config.RPM_FILTER_ALPHA,
@@ -54,9 +61,12 @@ speed = SpeedController(
     open_loop=config.DEBUG_MODE_DEFAULT,
     fixed_duty=config.DEBUG_FIXED_DUTY_PERCENT,
     debug_overspeed_rpm=config.DEBUG_OVERSPEED_RPM,
+    startup_kick_duty=config.MOTOR_START_KICK_DUTY_PERCENT,
+    startup_kick_seconds=config.MOTOR_START_KICK_SECONDS,
+    overspeed_confirmations=config.OVERSPEED_CONFIRMATIONS,
 )
-last_raw_count = sensor.count
 last_status = time.monotonic()
+last_raw_count = sensor.count
 command_buffer = ""
 
 
@@ -79,7 +89,8 @@ def print_status():
     """Print one machine-readable status line to USB serial."""
     print(
         "STATUS mode={} turns={} pulses={} target={} layer={} rpm={:.1f} "
-        "target_rpm={} motor={:.1f} fixed_pwm={:.1f} running={} fault={}".format(
+        "target_rpm={} motor={:.1f} fixed_pwm={:.1f} raw_pulses={} "
+        "overspeed_checks={} running={} fault={}".format(
             "debug" if speed.open_loop else "closed",
             state.turns,
             state.pending_pulses,
@@ -89,6 +100,8 @@ def print_status():
             target_rpm,
             speed.duty,
             speed.fixed_duty,
+            sensor.count,
+            speed.overspeed_count,
             int(speed.running),
             speed.fault or "none",
         )
@@ -102,6 +115,7 @@ def handle_command(command):
     if not parts:
         return
     if parts[0] == "start" and not state.complete:
+        set_servo()
         speed.start(time.monotonic())
         apply_motor_output()
     elif parts[0] == "stop":
@@ -139,12 +153,28 @@ def handle_command(command):
                 apply_motor_output()
             except ValueError as error:
                 print("ERROR {}".format(error))
+    elif parts[0] == "servo" and len(parts) == 2:
+        if speed.running:
+            print("ERROR stop motor before positioning servo")
+        else:
+            try:
+                percent = float(parts[1])
+                if not 0 <= percent <= 100:
+                    raise ValueError("servo percent must be from 0 to 100")
+                servo.duty_cycle = servo_duty_cycle(
+                    percent / 100.0,
+                    config.SERVO_PWM_FREQUENCY_HZ,
+                    config.SERVO_MIN_PULSE_US,
+                    config.SERVO_MAX_PULSE_US,
+                )
+            except ValueError as error:
+                print("ERROR {}".format(error))
     elif parts[0] == "status":
         print_status()
     else:
         print(
             "ERROR commands: start, stop, reset, speed +, speed -, "
-            "mode debug, mode closed, pwm <percent>, status"
+            "mode debug, mode closed, pwm <percent>, servo <percent>, status"
         )
 
 
@@ -156,14 +186,15 @@ print_status()
 while True:
     now = time.monotonic()
     raw_count = sensor.count
-    new_edges = raw_count - last_raw_count
+    new_pulses = raw_count - last_raw_count
     last_raw_count = raw_count
 
-    if speed.running and new_edges > 0:
-        # The controller observes the latest arrival time. Countio retains turns if
-        # serial output briefly delays the main loop and several edges accumulate.
+    if speed.running and new_pulses > 0:
         if speed.observe_pulse(now):
-            completed_turns = state.add_pulses(new_edges)
+            # A mechanical closure may add many raw falling edges before this loop
+            # runs. Count the batch once; observe_pulse provides the time lockout.
+            candidate_pulses = coalesce_counter_edges(new_pulses)
+            completed_turns = state.add_pulses(candidate_pulses)
             if completed_turns:
                 set_servo()
             if state.complete:
