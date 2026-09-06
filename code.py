@@ -7,23 +7,30 @@ import board
 import countio
 import pwmio
 import supervisor
+from adafruit_motorkit import MotorKit
 
 import config
-from winder import SpeedController, WinderState, servo_duty_cycle
+from winder import SpeedController, WinderState, motor_throttle, servo_duty_cycle
 
 
-SENSOR_PIN = board.D7       # RX silk label, PWM slice 2B (required by countio)
-MOTOR_PWM_PIN = board.D10   # MO silk label, PWM slice 1B
-SERVO_PWM_PIN = board.D3    # A3 silk label, PWM slice 5A
+SENSOR_PIN = board.D7      # RX silk label, PWM slice 2B (required by countio)
+SERVO_PWM_PIN = board.D3   # A3 silk label, PWM slice 5A
 
 
 state = WinderState(
     config.TARGET_TURNS,
     config.WINDING_WIDTH_MM,
     config.WIRE_DIAMETER_MM,
+    config.PULSES_PER_REVOLUTION,
 )
 sensor = countio.Counter(SENSOR_PIN, edge=countio.Edge.RISE, pull=None)
-motor = pwmio.PWMOut(MOTOR_PWM_PIN, frequency=config.MOTOR_PWM_FREQUENCY_HZ)
+i2c = board.I2C()  # QT Py SDA/D4 and SCL/D5 pins
+motor_hat = MotorKit(
+    i2c=i2c,
+    address=config.MOTOR_HAT_I2C_ADDRESS,
+    pwm_frequency=config.MOTOR_HAT_PWM_FREQUENCY_HZ,
+)
+motor = motor_hat.motor1
 servo = pwmio.PWMOut(SERVO_PWM_PIN, frequency=config.SERVO_PWM_FREQUENCY_HZ)
 
 target_rpm = config.START_RPM
@@ -43,6 +50,10 @@ speed = SpeedController(
     overspeed_ratio=config.OVERSPEED_RATIO,
     overspeed_margin_rpm=config.OVERSPEED_MARGIN_RPM,
     minimum_pulse_interval=config.SENSOR_MIN_INTERVAL_SECONDS,
+    pulses_per_revolution=config.PULSES_PER_REVOLUTION,
+    open_loop=config.DEBUG_MODE_DEFAULT,
+    fixed_duty=config.DEBUG_FIXED_DUTY_PERCENT,
+    debug_overspeed_rpm=config.DEBUG_OVERSPEED_RPM,
 )
 last_raw_count = sensor.count
 last_status = time.monotonic()
@@ -50,8 +61,8 @@ command_buffer = ""
 
 
 def apply_motor_output():
-    """Apply the controller's bounded duty request to the physical PWM."""
-    motor.duty_cycle = round(65535 * speed.duty / 100) if speed.running else 0
+    """Apply the controller's bounded duty request to Motor HAT terminal M1."""
+    motor.throttle = motor_throttle(speed.duty, speed.running)
 
 
 def set_servo():
@@ -67,14 +78,17 @@ def set_servo():
 def print_status():
     """Print one machine-readable status line to USB serial."""
     print(
-        "STATUS turns={} target={} layer={} rpm={:.1f} target_rpm={} "
-        "motor={:.1f} running={} fault={}".format(
+        "STATUS mode={} turns={} pulses={} target={} layer={} rpm={:.1f} "
+        "target_rpm={} motor={:.1f} fixed_pwm={:.1f} running={} fault={}".format(
+            "debug" if speed.open_loop else "closed",
             state.turns,
+            state.pending_pulses,
             state.target_turns,
             state.layer + 1,
             speed.measured_rpm or 0.0,
             target_rpm,
             speed.duty,
+            speed.fixed_duty,
             int(speed.running),
             speed.fault or "none",
         )
@@ -97,7 +111,9 @@ def handle_command(command):
         state.reset()
         set_servo()
     elif parts[0] == "speed" and len(parts) == 2:
-        if parts[1] == "+":
+        if speed.open_loop:
+            print("ERROR speed commands require closed-loop mode")
+        elif parts[1] == "+":
             target_rpm = min(config.MAX_TARGET_RPM, target_rpm + config.RPM_STEP)
             speed.set_target(target_rpm)
         elif parts[1] == "-":
@@ -105,10 +121,31 @@ def handle_command(command):
             speed.set_target(target_rpm)
         else:
             print("ERROR use: speed + | speed -")
+    elif parts[0] == "mode" and len(parts) == 2:
+        if speed.running:
+            print("ERROR stop motor before changing mode")
+        elif parts[1] == "debug":
+            speed.set_open_loop(True)
+        elif parts[1] == "closed":
+            speed.set_open_loop(False)
+        else:
+            print("ERROR use: mode debug | mode closed")
+    elif parts[0] == "pwm" and len(parts) == 2:
+        if not speed.open_loop:
+            print("ERROR pwm command requires debug mode")
+        else:
+            try:
+                speed.set_fixed_duty(float(parts[1]))
+                apply_motor_output()
+            except ValueError as error:
+                print("ERROR {}".format(error))
     elif parts[0] == "status":
         print_status()
     else:
-        print("ERROR commands: start, stop, reset, speed +, speed -, status")
+        print(
+            "ERROR commands: start, stop, reset, speed +, speed -, "
+            "mode debug, mode closed, pwm <percent>, status"
+        )
 
 
 apply_motor_output()
@@ -126,8 +163,9 @@ while True:
         # The controller observes the latest arrival time. Countio retains turns if
         # serial output briefly delays the main loop and several edges accumulate.
         if speed.observe_pulse(now):
-            state.add_turns(new_edges)
-            set_servo()
+            completed_turns = state.add_pulses(new_edges)
+            if completed_turns:
+                set_servo()
             if state.complete:
                 speed.stop()
                 apply_motor_output()

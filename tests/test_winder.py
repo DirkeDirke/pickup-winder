@@ -2,7 +2,7 @@
 
 import pytest
 
-from winder import SpeedController, WinderState, servo_duty_cycle
+from winder import SpeedController, WinderState, motor_throttle, servo_duty_cycle
 
 
 def controller(**overrides):
@@ -22,6 +22,10 @@ def controller(**overrides):
         overspeed_ratio=1.5,
         overspeed_margin_rpm=20,
         minimum_pulse_interval=0.02,
+        pulses_per_revolution=1,
+        open_loop=False,
+        fixed_duty=15,
+        debug_overspeed_rpm=300,
     )
     values.update(overrides)
     return SpeedController(**values)
@@ -50,9 +54,37 @@ def test_turn_count_stops_at_target():
     assert state.complete
 
 
+def test_six_sensor_pulses_complete_one_winding():
+    state = WinderState(7000, 14.8, 0.0635, pulses_per_revolution=6)
+    assert state.add_pulses(5) == 0
+    assert state.turns == 0
+    assert state.pending_pulses == 5
+    assert state.add_pulses(1) == 1
+    assert state.turns == 1
+    assert state.pending_pulses == 0
+
+
+def test_pulse_batches_preserve_partial_revolution():
+    state = WinderState(7000, 14.8, 0.0635, pulses_per_revolution=6)
+    assert state.add_pulses(14) == 2
+    assert state.turns == 2
+    assert state.pending_pulses == 2
+
+
 def test_servo_duty_cycle_for_standard_pulses():
     assert servo_duty_cycle(0.0, 50, 1000, 2000) == 3277
     assert servo_duty_cycle(1.0, 50, 1000, 2000) == 6554
+
+
+def test_motor_throttle_converts_percent_and_stops_safely():
+    assert motor_throttle(20, True) == pytest.approx(0.2)
+    assert motor_throttle(60, True) == pytest.approx(0.6)
+    assert motor_throttle(60, False) == 0.0
+
+
+def test_motor_throttle_never_requests_reverse_or_overdrive():
+    assert motor_throttle(-10, True) == 0.0
+    assert motor_throttle(120, True) == 1.0
 
 
 def test_speed_is_calculated_from_pulse_period():
@@ -61,6 +93,14 @@ def test_speed_is_calculated_from_pulse_period():
     assert control.observe_pulse(1.0)
     assert control.observe_pulse(2.0)
     assert control.measured_rpm == pytest.approx(60.0)
+
+
+def test_speed_uses_configured_pulses_per_revolution():
+    control = controller(pulses_per_revolution=6)
+    control.start(0.0)
+    control.observe_pulse(1.0)
+    control.observe_pulse(1.5)
+    assert control.measured_rpm == pytest.approx(20.0)
 
 
 def test_pi_controller_raises_duty_when_spindle_is_slow():
@@ -78,6 +118,46 @@ def test_output_ramp_limits_startup_change():
     control = controller(ramp_per_second=8)
     control.start(0.0)
     assert control.update(0.5) == pytest.approx(4.0)
+
+
+def test_debug_mode_holds_fixed_duty_while_measuring_rpm():
+    control = controller(open_loop=True, fixed_duty=25, pulses_per_revolution=6)
+    control.start(0.0)
+    assert control.update(0.1) == pytest.approx(25.0)
+    control.observe_pulse(1.0)
+    control.observe_pulse(1.2)
+    assert control.measured_rpm == pytest.approx(50.0)
+    assert control.update(1.21) == pytest.approx(25.0)
+
+
+def test_debug_fixed_duty_can_change_while_running():
+    control = controller(open_loop=True, fixed_duty=15)
+    control.start(0.0)
+    control.update(0.1)
+    control.set_fixed_duty(30)
+    assert control.duty == pytest.approx(30.0)
+
+
+def test_control_mode_change_requires_stopped_motor():
+    control = controller()
+    control.start(0.0)
+    with pytest.raises(RuntimeError, match="stop"):
+        control.set_open_loop(True)
+
+
+def test_debug_mode_retains_independent_overspeed_stop():
+    control = controller(
+        open_loop=True,
+        fixed_duty=20,
+        pulses_per_revolution=6,
+        debug_overspeed_rpm=100,
+    )
+    control.start(0.0)
+    control.observe_pulse(1.0)
+    control.observe_pulse(1.05)
+    control.update(1.06)
+    assert control.fault == "overspeed"
+    assert control.duty == 0.0
 
 
 def test_missing_startup_pulse_stops_motor():

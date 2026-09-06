@@ -3,6 +3,7 @@
 # Physical winding configuration.
 TARGET_TURNS = 7000
 WINDING_WIDTH_MM = 14.8
+PULSES_PER_REVOLUTION = 6
 # Nominal bare diameter for 42 AWG. Measure insulated wire and adjust this value.
 WIRE_DIAMETER_MM = 0.0635
 
@@ -13,12 +14,20 @@ MIN_TARGET_RPM = 10
 MAX_TARGET_RPM = 300
 STATUS_INTERVAL_SECONDS = 1.0
 
-# Motor PWM output. Keep this below 100 until the mechanism is proven safe.
-MOTOR_PWM_FREQUENCY_HZ = 20_000
+# Adafruit PCA9685 DC + Stepper Motor HAT. Motor output uses terminal M1.
+MOTOR_HAT_I2C_ADDRESS = 0x60
+MOTOR_HAT_PWM_FREQUENCY_HZ = 1600
+
+# Motor throttle limits. Keep these conservative until the mechanism is proven safe.
 START_MOTOR_DUTY_PERCENT = 20
 MIN_MOTOR_DUTY_PERCENT = 8
 MAX_MOTOR_DUTY_PERCENT = 60
 MOTOR_RAMP_PERCENT_PER_SECOND = 8.0
+
+# Open-loop diagnostic mode. It is disabled at boot unless explicitly enabled.
+DEBUG_MODE_DEFAULT = False
+DEBUG_FIXED_DUTY_PERCENT = 15
+DEBUG_OVERSPEED_RPM = 300
 
 # PI gains produce PWM percentage correction from RPM error. Start conservatively.
 SPEED_KP = 0.12

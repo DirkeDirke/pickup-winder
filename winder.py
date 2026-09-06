@@ -6,7 +6,7 @@ def _clamp(value, minimum, maximum):
 
 
 class SpeedController:
-    """Conservative PI spindle controller using one pulse per revolution."""
+    """Conservative PI spindle controller using configurable pulse feedback."""
 
     def __init__(
         self,
@@ -25,6 +25,10 @@ class SpeedController:
         overspeed_ratio,
         overspeed_margin_rpm,
         minimum_pulse_interval,
+        pulses_per_revolution=1,
+        open_loop=False,
+        fixed_duty=0,
+        debug_overspeed_rpm=300,
     ):
         if target_rpm <= 0:
             raise ValueError("target_rpm must be positive")
@@ -34,6 +38,12 @@ class SpeedController:
             raise ValueError("controller tuning values are invalid")
         if not 0 < filter_alpha <= 1:
             raise ValueError("filter_alpha must be in (0, 1]")
+        if int(pulses_per_revolution) != pulses_per_revolution or pulses_per_revolution <= 0:
+            raise ValueError("pulses_per_revolution must be a positive integer")
+        if not 0 <= fixed_duty <= maximum_duty:
+            raise ValueError("fixed_duty must be within the motor duty limit")
+        if debug_overspeed_rpm <= 0:
+            raise ValueError("debug_overspeed_rpm must be positive")
         self.target_rpm = float(target_rpm)
         self.startup_duty = float(startup_duty)
         self.minimum_duty = float(minimum_duty)
@@ -49,6 +59,10 @@ class SpeedController:
         self.overspeed_ratio = float(overspeed_ratio)
         self.overspeed_margin_rpm = float(overspeed_margin_rpm)
         self.minimum_pulse_interval = float(minimum_pulse_interval)
+        self.pulses_per_revolution = int(pulses_per_revolution)
+        self.open_loop = bool(open_loop)
+        self.fixed_duty = float(fixed_duty)
+        self.debug_overspeed_rpm = float(debug_overspeed_rpm)
         self.running = False
         self.fault = None
         self.duty = 0.0
@@ -69,6 +83,22 @@ class SpeedController:
         if target_rpm <= 0:
             raise ValueError("target_rpm must be positive")
         self.target_rpm = float(target_rpm)
+
+    def set_open_loop(self, enabled):
+        """Select fixed-duty debug mode; only permitted while stopped."""
+        if self.running:
+            raise RuntimeError("stop the motor before changing control mode")
+        self.open_loop = bool(enabled)
+        self.fault = None
+
+    def set_fixed_duty(self, duty_percent):
+        """Set bounded open-loop motor duty, including while running."""
+        duty_percent = float(duty_percent)
+        if not 0 <= duty_percent <= self.maximum_duty:
+            raise ValueError("fixed duty is outside the configured safe range")
+        self.fixed_duty = duty_percent
+        if self.running and self.open_loop:
+            self.duty = duty_percent
 
     def start(self, now):
         """Start from zero duty and clear prior measurements and faults."""
@@ -94,7 +124,7 @@ class SpeedController:
             period = now - self._last_pulse
             if period < self.minimum_pulse_interval:
                 return False
-            instantaneous = 60.0 / period
+            instantaneous = 60.0 / (period * self.pulses_per_revolution)
             if self.measured_rpm is None:
                 self.measured_rpm = instantaneous
             else:
@@ -122,13 +152,22 @@ class SpeedController:
             return 0.0
 
         if self.measured_rpm is not None:
-            overspeed_limit = max(
-                self.target_rpm * self.overspeed_ratio,
-                self.target_rpm + self.overspeed_margin_rpm,
-            )
+            if self.open_loop:
+                overspeed_limit = self.debug_overspeed_rpm
+            else:
+                overspeed_limit = max(
+                    self.target_rpm * self.overspeed_ratio,
+                    self.target_rpm + self.overspeed_margin_rpm,
+                )
             if self.measured_rpm > overspeed_limit:
                 self.stop("overspeed")
                 return 0.0
+
+        if self.open_loop:
+            self.duty = self.fixed_duty
+            return self.duty
+
+        if self.measured_rpm is not None:
             error = self.target_rpm - self.measured_rpm
             self._integral += error * elapsed
             if self.ki > 0:
@@ -147,15 +186,25 @@ class SpeedController:
 class WinderState:
     """Track turns and calculate a layer-synchronised traverse position."""
 
-    def __init__(self, target_turns, winding_width_mm, wire_diameter_mm):
+    def __init__(
+        self,
+        target_turns,
+        winding_width_mm,
+        wire_diameter_mm,
+        pulses_per_revolution=1,
+    ):
         if target_turns <= 0:
             raise ValueError("target_turns must be positive")
         if winding_width_mm <= 0 or wire_diameter_mm <= 0:
             raise ValueError("winding dimensions must be positive")
+        if int(pulses_per_revolution) != pulses_per_revolution or pulses_per_revolution <= 0:
+            raise ValueError("pulses_per_revolution must be a positive integer")
         self.target_turns = int(target_turns)
         self.winding_width_mm = float(winding_width_mm)
         self.wire_diameter_mm = float(wire_diameter_mm)
+        self.pulses_per_revolution = int(pulses_per_revolution)
         self.turns = 0
+        self.pending_pulses = 0
 
     @property
     def turns_per_layer(self):
@@ -189,9 +238,23 @@ class WinderState:
         self.turns += accepted
         return accepted
 
+    def add_pulses(self, count):
+        """Convert sensor pulses to completed revolutions and return turns added."""
+        count = int(count)
+        if count < 0:
+            raise ValueError("count must not be negative")
+        self.pending_pulses += count
+        completed_turns = self.pending_pulses // self.pulses_per_revolution
+        self.pending_pulses %= self.pulses_per_revolution
+        accepted = self.add_turns(completed_turns)
+        if self.complete:
+            self.pending_pulses = 0
+        return accepted
+
     def reset(self):
         """Reset winding progress to zero turns."""
         self.turns = 0
+        self.pending_pulses = 0
 
 
 def servo_duty_cycle(fraction, frequency_hz, min_pulse_us, max_pulse_us):
@@ -200,3 +263,10 @@ def servo_duty_cycle(fraction, frequency_hz, min_pulse_us, max_pulse_us):
     pulse_us = min_pulse_us + fraction * (max_pulse_us - min_pulse_us)
     period_us = 1_000_000 / frequency_hz
     return round(65535 * pulse_us / period_us)
+
+
+def motor_throttle(duty_percent, running):
+    """Convert controller duty percent into a safe forward MotorKit throttle."""
+    if not running:
+        return 0.0
+    return _clamp(float(duty_percent) / 100.0, 0.0, 1.0)
